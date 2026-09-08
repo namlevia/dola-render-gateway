@@ -39,11 +39,13 @@ FAKE_HEADERS = {
 CREDIT_FAIL_PATTERN = re.compile(
     r"無法生成|无法生成|不能生成|无法完成|無法完成|"
     r"余额不足|餘額不足|额度不足|額度不足|额度耗尽|額度耗盡|"
-    r"生成できません|残高不足|"
+    r"生成できません|残高不足|動画クレジット|クレジットが使用されます|本日は残り\s*\d+|"
+    r"クレジット.*不足|ポイント.*不足|"
     r"生成할 수 없|한도.*부족|부족.*한도|"
     r"insufficient|unable to (generate|create)|failed to (generate|create)",
     re.IGNORECASE,
 )
+
 
 
 # ============ Helpers ============

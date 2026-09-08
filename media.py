@@ -80,7 +80,15 @@ async def validate_reference_urls(urls: list[str]) -> list[str]:
     normalized = []
     seen = set()
     for raw in urls:
-        url = await _validate_url_async(raw)
+        raw_str = str(raw or "").strip()
+        if not raw_str:
+            continue
+        # Support base64 data URLs, local files, and gateway uploaded media
+        parsed = urlparse(raw_str)
+        if raw_str.startswith("data:image/") or Path(raw_str).is_file() or parsed.path.startswith("/videos/"):
+            url = raw_str
+        else:
+            url = await _validate_url_async(raw_str)
         if url not in seen:
             normalized.append(url)
             seen.add(url)
@@ -111,6 +119,50 @@ async def _read_response_image(resp: aiohttp.ClientResponse) -> tuple[bytes, str
 
 
 async def download_one_image(session: aiohttp.ClientSession, url: str, dest: Path) -> Path:
+    # 1. Base64 Data URL
+    if url.startswith("data:image/"):
+        import base64
+        _, b64data = url.split(",", 1)
+        data = base64.b64decode(b64data)
+        with Image.open(BytesIO(data)) as image:
+            image.verify()
+            fmt = image.format
+        if fmt not in _ALLOWED_IMAGE_FORMATS:
+            raise ValueError("Reference image only supports JPEG, PNG, WEBP")
+        path = dest.with_suffix(_ALLOWED_IMAGE_FORMATS[fmt])
+        path.write_bytes(data)
+        return path
+
+    # 2. Local file on filesystem
+    clean_local = url.replace("file://", "")
+    if Path(clean_local).is_file():
+        data = Path(clean_local).read_bytes()
+        with Image.open(BytesIO(data)) as image:
+            image.verify()
+            fmt = image.format
+        if fmt not in _ALLOWED_IMAGE_FORMATS:
+            raise ValueError("Reference image only supports JPEG, PNG, WEBP")
+        path = dest.with_suffix(_ALLOWED_IMAGE_FORMATS[fmt])
+        path.write_bytes(data)
+        return path
+
+    # 3. Server-hosted /videos/ reference
+    parsed = urlparse(url)
+    if parsed.path.startswith("/videos/"):
+        filename = Path(parsed.path).name
+        local_ref = Path(config.DOWNLOAD_DIR) / filename
+        if local_ref.is_file():
+            data = local_ref.read_bytes()
+            with Image.open(BytesIO(data)) as image:
+                image.verify()
+                fmt = image.format
+            if fmt not in _ALLOWED_IMAGE_FORMATS:
+                raise ValueError("Reference image only supports JPEG, PNG, WEBP")
+            path = dest.with_suffix(_ALLOWED_IMAGE_FORMATS[fmt])
+            path.write_bytes(data)
+            return path
+
+    # 4. Public HTTP(S) URL
     current = await _validate_url_async(url)
     # Try configured proxy first, fall back to direct connection if blocked
     proxies = []

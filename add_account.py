@@ -30,7 +30,7 @@ def totp(secret: str, period: int = 30, digits: int = 6) -> str:
 
 async def google_login(g, email: str, password: str, secret: str):
     """Executes Google OAuth login state machine until callback."""
-    for step in range(12):
+    for step in range(60):
         await g.wait_for_timeout(2500)
         if "accounts.google.com" not in g.url:
             print("[google] Redirected out of Google domain (OAuth callback)", flush=True)
@@ -97,11 +97,15 @@ async def google_login(g, email: str, password: str, secret: str):
             print(f"[dola] Age confirmation -> JS click OK = {ok}", flush=True)
             await g.wait_for_timeout(1500)
             continue
+        # 7) Captcha / challenge wait
+        if "challenge" in g.url or "recaptcha" in g.url:
+            print(f"[google] Step {step}: Google requires Captcha/Verification. Waiting for user to solve on screen...", flush=True)
+            continue
         txt = await g.evaluate("() => (document.body && document.body.innerText || '').slice(0, 300)")
         print(f"[google] step{step} unrecognized page url={g.url[:80]} text={txt[:200]}", flush=True)
     if "accounts.google.com" in g.url:
         await g.screenshot(path="dbg_google2.png")
-        raise RuntimeError("Google login did not complete within 12 steps (saved dbg_google2.png)")
+        raise RuntimeError("Google login did not complete within 60 steps (saved dbg_google2.png)")
 
 
 async def add_account_flow(account: str, email: str, password: str, secret: str) -> bool:

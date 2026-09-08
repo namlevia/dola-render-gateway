@@ -9,11 +9,13 @@ from pathlib import Path
 
 from dola_client import CreditError
 from video_worker_ui import (
-    AccountLimitedError, CreditInsufficientError, RiskControlError, generate_video, resume_video,
+    AccountLimitedError, ContentPolicyViolationError, CreditInsufficientError,
+    RiskControlError, generate_video, resume_video,
 )
 import config
 
-DAILY_LIMIT = 2
+
+DEFAULT_DAILY_LIMIT = getattr(config, "ACCOUNT_DAILY_LIMIT", 50)
 COOLDOWN_SEC = 1800  # 30-minute cooldown on risk control
 
 
@@ -54,7 +56,8 @@ class BrowserPool:
                 quota_blocked_until REAL DEFAULT 0,
                 quota_reason TEXT DEFAULT '',
                 credit_balance INTEGER,
-                credit_checked_at REAL DEFAULT 0
+                credit_checked_at REAL DEFAULT 0,
+                daily_limit INTEGER DEFAULT NULL
             )
             """
         )
@@ -68,6 +71,7 @@ class BrowserPool:
             ("quota_reason", "TEXT DEFAULT ''"),
             ("credit_balance", "INTEGER"),
             ("credit_checked_at", "REAL DEFAULT 0"),
+            ("daily_limit", "INTEGER DEFAULT NULL"),
         ):
             try:
                 self._conn.execute(f"ALTER TABLE accounts_meta ADD COLUMN {column} {definition}")
@@ -142,12 +146,22 @@ class BrowserPool:
         )
         self._conn.commit()
 
+    def _account_limit(self, account: str, meta=None) -> int:
+        m = meta if meta is not None else self._meta(account)
+        try:
+            if m and m["daily_limit"] is not None and int(m["daily_limit"]) > 0:
+                return int(m["daily_limit"])
+        except Exception:
+            pass
+        return getattr(config, "ACCOUNT_DAILY_LIMIT", 50)
+
     def _mark_daily_limit(self, account: str, reason: str = ""):
         """Marks account as reaching daily limit until next reset."""
+        limit = self._account_limit(account)
         self._conn.execute(
             "INSERT INTO usage(account, day, used) VALUES (?,?,?) "
             "ON CONFLICT(account, day) DO UPDATE SET used=MAX(used, excluded.used)",
-            (account, date.today().isoformat(), DAILY_LIMIT),
+            (account, date.today().isoformat(), limit),
         )
         self._conn.execute(
             "UPDATE accounts_meta SET last_used_at=?, rate_limited_until=?, limit_reason=? WHERE name=?",
@@ -163,6 +177,7 @@ class BrowserPool:
         for a in self.accounts:
             m = self._meta(a)
             used = self.used_today(a)
+            limit = self._account_limit(a, m)
             lock = self._locks.get(a)
             out.append({
                 "name": a,
@@ -184,23 +199,44 @@ class BrowserPool:
                 "credit_balance": m["credit_balance"] if m else None,
                 "credit_checked_at": m["credit_checked_at"] if m else 0,
                 "used_today": used,
-                "limit": DAILY_LIMIT,
-                "remaining": max(0, DAILY_LIMIT - used),
+                "limit": limit,
+                "remaining": max(0, limit - used),
+                "custom_limit": bool(m and m["daily_limit"] is not None and m["daily_limit"] > 0),
                 "busy": bool(lock and lock.locked()),
             })
         return out
 
     def set_scheduling(self, name: str, on: bool):
+        self._ensure_meta(name)
         self._conn.execute(
             "UPDATE accounts_meta SET scheduling=? WHERE name=?", (1 if on else 0, name))
         self._conn.commit()
 
+    def set_daily_limit(self, name: str, limit: int | None):
+        self._ensure_meta(name)
+        val = int(limit) if limit and int(limit) > 0 else None
+        self._conn.execute(
+            "UPDATE accounts_meta SET daily_limit=? WHERE name=?", (val, name))
+        if val is not None and val > self.used_today(name):
+            self._conn.execute(
+                "UPDATE accounts_meta SET rate_limited_until=0, limit_reason='' WHERE name=?", (name,))
+        self._conn.commit()
+
+    def reset_usage(self, name: str):
+        today = date.today().isoformat()
+        self._conn.execute("UPDATE usage SET used=0 WHERE account=? AND day=?", (name, today))
+        self._conn.execute(
+            "UPDATE accounts_meta SET rate_limited_until=0, limit_reason='' WHERE name=?", (name,))
+        self._conn.commit()
+
     def set_email(self, name: str, email: str):
+        self._ensure_meta(name)
         self._conn.execute(
             "UPDATE accounts_meta SET email=? WHERE name=?", (email, name))
         self._conn.commit()
 
     def set_login_status(self, name: str, ok: bool):
+        self._ensure_meta(name)
         self._conn.execute(
             "UPDATE accounts_meta SET login_ok=?, login_checked_at=? WHERE name=?",
             (1 if ok else 0, time.time(), name),
@@ -208,9 +244,11 @@ class BrowserPool:
         self._conn.commit()
 
     def set_note(self, name: str, note: str):
+        self._ensure_meta(name)
         self._conn.execute(
             "UPDATE accounts_meta SET note=? WHERE name=?", (note, name))
         self._conn.commit()
+
 
     def delete_account(self, name: str):
         lock = self._locks.get(name)
@@ -257,23 +295,24 @@ class BrowserPool:
         return not row or row["credit_balance"] is None or row["credit_balance"] >= required
 
     def _schedulable(self, a: dict) -> bool:
+        limit = a.get("limit") or self._account_limit(a["name"])
         return (a["scheduling"] and not a["cooling"] and not a["rate_limited"]
-                and not a["quota_blocked"] and a["used_today"] < DAILY_LIMIT
-                and (a["credit_balance"] is None or a["credit_balance"] >= 2))
+                and not a["quota_blocked"] and a["used_today"] < limit
+                and (a["credit_balance"] is None or a["credit_balance"] >= getattr(config, "VIDEO_REQUIRED_POINTS", 2)))
 
     @property
     def all_accounts_limited(self) -> bool:
         """Returns True if all active accounts have reached daily limit."""
         candidates = [a for a in self.list_accounts() if a["scheduling"] and not a["cooling"]]
         return bool(candidates) and all(
-            a["rate_limited"] or a["used_today"] >= DAILY_LIMIT for a in candidates
+            a["rate_limited"] or a["used_today"] >= a.get("limit", DEFAULT_DAILY_LIMIT) for a in candidates
         )
 
     @property
     def all_accounts_quota_blocked(self) -> bool:
         candidates = [a for a in self.list_accounts() if a["scheduling"] and not a["cooling"]]
         return bool(candidates) and all(
-            a["quota_blocked"] or a["rate_limited"] or a["used_today"] >= DAILY_LIMIT
+            a["quota_blocked"] or a["rate_limited"] or a["used_today"] >= a.get("limit", DEFAULT_DAILY_LIMIT)
             for a in candidates
         ) and any(a["quota_blocked"] for a in candidates)
 
@@ -309,6 +348,9 @@ class BrowserPool:
                         (time.time(), account))
                     self._conn.commit()
                     return result
+                except ContentPolicyViolationError as e:
+                    print(f"[pool] {account} content policy violation on resume: {e}", flush=True)
+                    raise
                 except TimeoutError:
                     self._claim(account)
                     self._conn.commit()
@@ -346,11 +388,15 @@ class BrowserPool:
                             (time.time(), account))
                         self._conn.commit()
                         return result
+                    except ContentPolicyViolationError as e:
+                        print(f"[pool] {account} content policy violation, aborting immediately: {e}", flush=True)
+                        raise
                     except CreditInsufficientError as e:
                         print(f"[pool] {account} insufficient points before generation, skipping: {e}", flush=True)
                         self._mark_quota_blocked(account, str(e))
                         last_err = e
                         continue
+
                     except AccountLimitedError as e:
                         print(f"[pool] {account} reached daily limit, rotating: {e}", flush=True)
                         self._mark_daily_limit(account, str(e))

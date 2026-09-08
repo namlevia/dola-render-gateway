@@ -41,8 +41,8 @@ DB_PATH = os.getenv("DOLA_DB_PATH", "tasks.db")
 # Video download storage directory (served statically by FastAPI)
 DOWNLOAD_DIR = os.getenv("DOLA_DOWNLOAD_DIR", "downloads")
 
-# Explicit browser proxy (must point to JP/KR egress; empty = system proxy)
-PROXY = os.getenv("DOLA_PROXY", "http://127.0.0.1:7890")
+# Explicit browser proxy (must point to JP/KR egress; empty = direct / system proxy)
+PROXY = os.getenv("DOLA_PROXY", "")
 
 # Run browser in headless mode (login always runs with head)
 HEADLESS = os.getenv("DOLA_HEADLESS", "1") == "1"
@@ -59,6 +59,9 @@ EXTENSION_ENABLED = os.getenv("DOLA_EXTENSION_ENABLED", "1") == "1"
 
 # Daily quota reset timezone (Japan midnight by default)
 LIMIT_RESET_TZ = os.getenv("DOLA_LIMIT_RESET_TZ", "Asia/Tokyo")
+
+# Default daily video limit per account (default 50, configurable)
+ACCOUNT_DAILY_LIMIT = int(os.getenv("DOLA_ACCOUNT_DAILY_LIMIT", "50"))
 
 # Conservative credit check before video generation (default 2 points)
 VIDEO_REQUIRED_POINTS = int(os.getenv("DOLA_VIDEO_REQUIRED_POINTS", "2"))

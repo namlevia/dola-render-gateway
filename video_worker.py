@@ -1,10 +1,19 @@
 """Video worker: in-page fetch submission and /im/chain/single polling."""
 import asyncio
 import base64
+import hashlib
 import json
+import re
 import sys
 import time
+import urllib.parse
+import urllib.request
 from pathlib import Path
+
+try:
+    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+except ImportError:
+    Cipher = None
 
 import aiohttp
 from patchright.async_api import async_playwright
@@ -88,10 +97,156 @@ async ({conversationId, msToken, fp}) => {
 """
 
 
-def extract_unwatermarked_url(video_model_str: str, fallback_url: str) -> str:
-    """Extracts unwatermarked video URL (base64) from video_model.video_list."""
+QAAB_SALT_HEX = (
+    "4dd4c2e6b83162090e52b3c7a6733ba4"
+    "1cb2462b829ab58a196b39db57177524"
+    "f49baf7f08e8d68d26a72e37c1a95a2f"
+    "1f05a51892aef2949732b62a38aadd58"
+)
+
+
+def is_watermarked_media_url(url: str) -> bool:
+    """Checks if video URL contains watermark markers."""
+    if not url:
+        return True
+    u = str(url)
+    if re.search(r"video_gen_watermark", u, re.I):
+        return True
+    if re.search(r"[?&]lr=watermarked\b", u, re.I):
+        return True
+    if re.search(r"[?&]logo_type=(?:watermarked|wm)\b", u, re.I):
+        return True
+    if re.search(r"/(?:wm|watermark)(?:/|_)", u, re.I):
+        return True
+    return False
+
+
+def _base64_decode_loose(s: str) -> bytes:
+    s = str(s or "").strip().replace("-", "+").replace("_", "/")
+    pad = (4 - len(s) % 4) % 4
+    return base64.b64decode(s + "=" * pad)
+
+
+def decode_qaab_token(token: str, key_seed: str) -> str:
+    """Decrypts AES-CBC qAAB video URL tokens from ByteDance fallback_api."""
+    if not Cipher:
+        return ""
     try:
-        vm = json.loads(video_model_str or "{}")
+        data = _base64_decode_loose(token)
+        seed = _base64_decode_loose(key_seed)
+        if not data or not seed:
+            return ""
+        digest1 = hashlib.sha512(seed[:32]).digest()
+        salt = bytes.fromhex(QAAB_SALT_HEX)
+        digest2 = hashlib.sha512(digest1 + salt).digest()
+        key = digest2[:16]
+        iv = digest2[16:32]
+
+        attempts = []
+        if len(data) >= 4 and data[:4] == b"\xa8\x00\x01\x00":
+            attempts.append((data[4:], key, iv))
+            attempts.append((data[4:], iv, key))
+            if len(data) > 36:
+                attempts.append((data[36:], key, data[20:36]))
+                attempts.append((data[36:], key, iv))
+        else:
+            attempts.append((data, key, iv))
+
+        for payload, k, v in attempts:
+            if len(payload) % 16 != 0:
+                continue
+            try:
+                cipher = Cipher(algorithms.AES(k), modes.CBC(v))
+                decryptor = cipher.decryptor()
+                plain = decryptor.update(payload) + decryptor.finalize()
+                pad_len = plain[-1]
+                if 1 <= pad_len <= 16 and plain.endswith(bytes([pad_len]) * pad_len):
+                    unpadded = plain[:-pad_len]
+                else:
+                    unpadded = plain
+                text = unpadded.decode("latin1")
+                if text.startswith("http://") or text.startswith("https://"):
+                    return text
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return ""
+
+
+def resolve_fallback_api_unwatermarked(fallback_api: str, key_seed: str = "") -> str:
+    """Queries fallback_api with logo_type=unwatermarked and extracts clean URL."""
+    try:
+        parsed = urllib.parse.urlparse(fallback_api)
+        qs = urllib.parse.parse_qs(parsed.query)
+        qs["channel"] = ["no"]
+        qs["codec_type"] = ["8"]
+        qs["logo_type"] = ["unwatermarked"]
+        new_url = urllib.parse.urlunparse(parsed._replace(query=urllib.parse.urlencode(qs, doseq=True)))
+
+        if not key_seed:
+            seed_param = qs.get("key_seed")
+            if seed_param:
+                key_seed = seed_param[0]
+
+        req = urllib.request.Request(
+            new_url,
+            headers={"Accept": "application/json,text/plain,*/*", "User-Agent": "Mozilla/5.0"}
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read().decode("utf-8", "ignore"))
+
+        video_info = data.get("video_info") or data.get("data", {}).get("video_info") or data
+        vdata = video_info.get("data") or video_info
+        vlist = vdata.get("video_list") or {}
+
+        if not key_seed:
+            key_seed = vdata.get("key_seed") or data.get("key_seed") or ""
+
+        candidates = []
+        entries = list(vlist.values()) if isinstance(vlist, dict) else [vdata]
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            token = entry.get("main_url") or entry.get("play_url") or ""
+            if not token:
+                continue
+            score = int(entry.get("bitrate") or entry.get("real_bitrate") or 0)
+            candidates.append((score, token))
+
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        for _, token in candidates:
+            if token.startswith("http"):
+                url = token
+            elif token.startswith("qAAB") and key_seed:
+                url = decode_qaab_token(token, key_seed)
+            else:
+                try:
+                    url = _base64_decode_loose(token).decode("latin1", "ignore")
+                except Exception:
+                    url = ""
+            if url.startswith("http") and not is_watermarked_media_url(url):
+                return url
+            elif url.startswith("http"):
+                return url
+    except Exception as e:
+        print(f"[video_worker] Failed to resolve fallback_api unwatermarked: {e}", flush=True)
+    return ""
+
+
+def extract_unwatermarked_url(video_model_str: str, fallback_url: str) -> str:
+    """Extracts unwatermarked video URL (fallback_api priority + qAAB decryption, or video_list)."""
+    try:
+        vm = json.loads(video_model_str or "{}") if isinstance(video_model_str, str) else (video_model_str or {})
+        fallback_api = vm.get("fallback_api") or ""
+        key_seed = vm.get("key_seed") or ""
+        if fallback_api:
+            clean_url = resolve_fallback_api_unwatermarked(fallback_api, key_seed)
+            if clean_url and not is_watermarked_media_url(clean_url):
+                return clean_url
+            if clean_url:
+                return clean_url
+
         video_list = vm.get("video_list") or {}
         candidates = []
         for v in video_list.values():
@@ -101,13 +256,16 @@ def extract_unwatermarked_url(video_model_str: str, fallback_url: str) -> str:
             if not main_url:
                 continue
             try:
-                decoded = base64.b64decode(main_url).decode("utf-8", "ignore")
+                decoded = _base64_decode_loose(main_url).decode("utf-8", "ignore")
             except Exception:
                 continue
             if decoded.startswith("http"):
                 candidates.append((int(v.get("bitrate") or v.get("real_bitrate") or 0), decoded))
         if candidates:
             candidates.sort(key=lambda x: x[0], reverse=True)
+            clean_candidates = [c for c in candidates if not is_watermarked_media_url(c[1])]
+            if clean_candidates:
+                return clean_candidates[0][1]
             return candidates[0][1]
     except Exception:
         pass
@@ -162,7 +320,6 @@ async def generate_video(account: str, prompt: str, ratio: str = "9:16",
     Returns {"video_url": cdn_url, "local_path": local_file, "conversation_id": ...}
     Exceptions: RiskControlError, CreditError, TimeoutError, FileNotFoundError
     """
-    """
     timeout = timeout or config.VIDEO_TIMEOUT
     async with async_playwright() as p:
         context = await launch_account_context(p, account)
@@ -208,7 +365,10 @@ async def generate_video(account: str, prompt: str, ratio: str = "9:16",
 
                 videos = poll.get("videos", [])
                 if videos:
-                    url = videos[0]
+                    video_models = poll.get("videoModels", [])
+                    url = extract_unwatermarked_url(
+                        video_models[0] if video_models else "", videos[0]
+                    )
                     print(f"[{account}] Video completed download_url={url[:100]}...", flush=True)
                     local = await _download(url, account)
                     print(f"[{account}] Downloaded {local} ({local.stat().st_size / 1e6:.1f} MB)", flush=True)

@@ -1,4 +1,4 @@
-﻿<!DOCTYPE html>
+<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
@@ -88,9 +88,11 @@ td .prompt{display:block;max-width:340px;overflow:hidden;text-overflow:ellipsis;
   <div class="head-r">
     <label><input type="checkbox" id="autoCk" checked onchange="autoRefresh=this.checked">Auto Refresh</label>
     <span id="lastUpdate"></span>
+    <a href="/api/admin/live_screenshot" target="_blank" class="btn" style="text-decoration:none;display:inline-flex;align-items:center;gap:4px;" title="Xem ảnh chụp màn hình Dola">📸 Màn hình Dola</a>
     <button class="btn" onclick="refresh()">Refresh</button>
     <button class="btn" onclick="logout()" title="Logout">Logout</button>
   </div>
+
 </header>
 
 <nav>
@@ -111,14 +113,24 @@ td .prompt{display:block;max-width:340px;overflow:hidden;text-overflow:ellipsis;
     <div class="card">
       <div class="toolbar">
         <h3 style="margin:0">Account List</h3>
-        <button class="btn btn-p" onclick="openAddAccount()">＋ Add Account</button>
+        <div style="display:flex;gap:8px;flex-wrap:wrap">
+          <button class="btn btn-p" onclick="openImportCookie()">🍪 Thêm bằng Cookie</button>
+          <button class="btn" style="background:#e6f4ea;color:#137333;border-color:#ceead6;font-weight:600" onclick="openExtensionGuide()">🧩 Chrome Extension Sync</button>
+          <button class="btn" onclick="openAddAccount()">🌐 Đăng nhập Chrome</button>
+        </div>
       </div>
       <div id="accountsTable"></div>
     </div>
   </section>
 
   <section id="tab-tasks" style="display:none">
-    <div class="card"><h3>Task Queue (Last 50)</h3><div id="tasksTable"></div></div>
+    <div class="card">
+      <div class="toolbar">
+        <h3 style="margin:0">Task Queue (Last 50)</h3>
+        <button class="btn btn-p" onclick="openCreateTask()">＋ Generate Video</button>
+      </div>
+      <div id="tasksTable"></div>
+    </div>
   </section>
 
   <section id="tab-keys" style="display:none">
@@ -257,13 +269,53 @@ async function loadAccounts(){
       accLabel(x)+warn,
       badge,
       `<label class="sw"><input type="checkbox" ${x.scheduling?'checked':''} onchange="setSched('${x.name}',this.checked)"><i></i></label>`,
-      `<b>${x.used_today}</b> / ${x.limit}`,
+      `<span style="display:inline-flex;align-items:center;gap:4px"><b>${x.used_today}</b> / ${x.limit} <a href="javascript:void(0)" onclick="editAccountLimit('${x.name}',${x.limit},${x.used_today})" title="Chỉnh sửa giới hạn (Daily Limit)" style="text-decoration:none;font-size:12px;cursor:pointer">✏️</a></span>`,
       fmt(x.last_used_at),
       fmt(x.created_at),
-      `<button class="btn" style="margin-right:6px" onclick="verify('${x.name}',this)">Verify</button><button class="btn btn-danger" onclick="delAccount('${x.name}')">Delete</button>`
+      `<button class="btn" style="margin-right:6px" onclick="verify('${x.name}',this)">Verify</button><button class="btn" style="margin-right:6px" onclick="editAccountLimit('${x.name}',${x.limit},${x.used_today})" title="Chỉnh sửa giới hạn / Reset">Limit ⚙️</button><button class="btn btn-danger" onclick="delAccount('${x.name}')">Delete</button>`
     ];
   });
-  q('#accountsTable').innerHTML=table(['Account ID','Name','Status','Dispatch','Remaining','Last Used','Created At','Actions'],rows);
+  q('#accountsTable').innerHTML=table(['Account ID','Name','Status','Dispatch','Used / Limit','Last Used','Created At','Actions'],rows);
+}
+
+function editAccountLimit(name, currentLimit, usedToday){
+  showDlg(`<h2>⚙️ Cài đặt giới hạn: ${esc(name)}</h2>
+    <div class="tiny" style="margin-bottom:12px;color:var(--sub)">Số video đã tạo hôm nay: <b>${usedToday}</b> / <b>${currentLimit}</b></div>
+    <label>Giới hạn video mỗi ngày (Daily Limit):</label>
+    <div style="display:flex;gap:8px;margin-bottom:16px">
+      <input id="f_limit" type="number" min="1" max="10000" value="${currentLimit}" style="font-size:15px;font-weight:600">
+      <button class="btn btn-p" onclick="saveAccountLimit('${name}')">Lưu</button>
+    </div>
+    <div style="border-top:1px solid var(--border);padding-top:12px;margin-top:12px">
+      <div class="tiny" style="margin-bottom:8px;color:var(--sub)">Nếu muốn xoá bộ đếm số lượt video đã tạo trong ngày hôm nay:</div>
+      <button class="btn" type="button" onclick="resetAccountUsage('${name}')" style="background:#fef2f2;color:#b91c1c;border:1px solid #fecaca">🔄 Reset số lượt hôm nay về 0</button>
+    </div>
+    <div class="row" style="margin-top:20px">
+      <button class="btn" onclick="hide('dlg')">Đóng</button>
+    </div>`);
+}
+
+async function saveAccountLimit(name){
+  const val = parseInt(q('#f_limit').value, 10);
+  if(!val || val < 1) return alert('Vui lòng nhập số giới hạn hợp lệ (>= 1)');
+  try {
+    await api('/api/admin/accounts/'+name, {method: 'PATCH', body: {daily_limit: val}});
+    hide('dlg');
+    refresh();
+  } catch(e) {
+    alert(e.message);
+  }
+}
+
+async function resetAccountUsage(name){
+  if(!confirm('Bạn có chắc muốn reset số lượt video đã dùng hôm nay của '+name+' về 0?')) return;
+  try {
+    await api('/api/admin/accounts/'+name+'/reset_usage', {method: 'POST'});
+    hide('dlg');
+    refresh();
+  } catch(e) {
+    alert(e.message);
+  }
 }
 
 async function verify(name,btn){
@@ -295,27 +347,279 @@ async function submitAddAccount(){
   hide('dlg');refresh();
 }
 
+function openExtensionGuide(){
+  const extPath = '/Volumes/Data/dola-render-gateway/extensions/dola_cookie_sync';
+  showDlg(`<h2>🧩 Chrome Extension: Dola Cookie Sync</h2>
+    <div class="tiny" style="margin-bottom:12px;color:var(--sub)">Tiện ích giúp đồng bộ Cookie từ trang dola.com / facebook.com về Gateway chỉ với 1-Click!</div>
+    
+    <label>1. Thư mục Extension trên máy:</label>
+    <div style="display:flex;gap:6px;margin-bottom:8px">
+      <input id="ext_path_input" value="${extPath}" readonly style="background:#f5f7f6;font-family:monospace;font-size:11px">
+      <button class="btn" onclick="navigator.clipboard.writeText('${extPath}');this.textContent='✓ Đã copy';setTimeout(()=>this.textContent='Copy',2000)">Copy</button>
+    </div>
+    <div style="margin-bottom:12px">
+      <a href="/dola_cookie_sync.zip" download="dola_cookie_sync.zip" class="btn" style="display:inline-flex;align-items:center;gap:6px;padding:6px 12px;text-decoration:none;font-size:12px;background:#f0fdf4;color:#166534;border:1px solid #bbf7d0;border-radius:6px">
+        ⬇️ Tải file Zip Extension (dola_cookie_sync.zip)
+      </a>
+    </div>
+
+    <div style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;padding:12px;font-size:12px;line-height:1.6;color:#334155">
+      <b>📌 Các bước cài đặt cực nhanh:</b><br>
+      <b>Bước 1:</b> Mở Chrome, truy cập: <code style="background:#e2e8f0;padding:2px 4px;border-radius:4px">chrome://extensions</code><br>
+      <b>Bước 2:</b> Bật công tắc <b>"Chế độ dành cho nhà phát triển" (Developer mode)</b> ở góc trên bên phải.<br>
+      <b>Bước 3:</b> Nhấn nút <b>"Tải tiện ích đã giải nén" (Load unpacked)</b> &rarr; chọn thư mục đã copy ở trên (<code>dola_cookie_sync</code>).<br>
+      <b>Bước 4:</b> Đăng nhập tài khoản trên <a href="https://www.dola.com/chat" target="_blank" style="color:var(--accent);font-weight:600">dola.com/chat</a> &rarr; Bấm vào icon tiện ích <b>Cookie Sync</b> trên thanh công cụ Chrome &rarr; Bấm <b>⚡ 1-Click Sync to Gateway</b>.<br>
+      <i>Tài khoản sẽ lập tức xuất hiện trong Gateway ở trạng thái <b>Active ✓</b>!</i>
+    </div>
+
+    <div class="row">
+      <button class="btn" onclick="hide('dlg')">Đóng</button>
+      <button class="btn btn-p" onclick="openImportCookie()">🍪 Nhập Cookie thủ công</button>
+    </div>`);
+}
+
+function openImportCookie(){
+  let def='acc'+(document.querySelectorAll('#accountsTable tbody tr').length+1);
+  showDlg(`<h2>🍪 Thêm Tài Khoản Bằng Cookie</h2>
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;background:#f0fdf4;padding:8px 12px;border-radius:8px;border:1px solid #bbf7d0">
+      <span style="font-size:12px;color:#166534">💡 Muốn tự động đồng bộ 1-click từ Chrome?</span>
+      <button class="btn" style="padding:4px 8px;font-size:11px;background:#166534;color:#fff;border:none" onclick="openExtensionGuide()">Xem hướng dẫn Extension</button>
+    </div>
+    <div class="tiny" style="margin-bottom:12px;color:var(--sub)">Nhập Cookie trực tiếp để kích hoạt tài khoản ngay tức thì, tránh hoàn toàn bot detection, CAPTCHAs, hay 2FA của Google.</div>
+    <label>Tên tài khoản (Account ID)</label>
+    <input id="ck_name" value="${def}" placeholder="Ví dụ: acc3 hoặc dola_01">
+    <label>Nền tảng</label>
+    <select id="ck_platform" style="width:100%;padding:8px 12px;border:1px solid var(--line);border-radius:8px;font-size:13px;background:#fff">
+      <option value="dola" selected>Dola (dola.com)</option>
+      <option value="facebook">Facebook (facebook.com)</option>
+      <option value="other">Khác</option>
+    </select>
+    <label>Email / Ghi chú (Tuỳ chọn)</label>
+    <input id="ck_email" placeholder="ví dụ: user@gmail.com">
+    <label>Dán chuỗi Cookie hoặc mảng JSON</label>
+    <textarea id="ck_content" rows="6" style="width:100%;padding:8px 12px;border:1px solid var(--line);border-radius:8px;font-size:12px;font-family:monospace;resize:vertical" placeholder="Dán chuỗi cookie (sessionid=...; msToken=...)&#10;HOẶC JSON xuất từ Cookie-Editor ([{&quot;name&quot;: &quot;sessionid&quot;, ...}])"></textarea>
+    <div class="tiny" style="margin-top:8px;padding:8px 10px;background:#f5f8f7;border-radius:6px;color:var(--sub);line-height:1.4">
+      💡 <b>Cách lấy Cookie:</b><br>
+      • <b>Cách 1:</b> Mở trang web (dola.com) đã đăng nhập &rarr; F12 (DevTools) &rarr; tab <i>Application</i> &rarr; <i>Cookies</i> &rarr; copy giá trị của <code>sessionid</code> (dán vào ô trên dạng <code>sessionid=xxxx</code>).<br>
+      • <b>Cách 2:</b> Cài tiện ích <b>Cookie-Editor</b> trên Chrome &rarr; bấm <i>Export JSON</i> &rarr; dán toàn bộ vào ô trên.<br>
+      • <b>Cách 3:</b> Cài Chrome extension <b>Dola Cookie Sync</b> trong thư mục <code>extensions/dola_cookie_sync</code> &rarr; 1-click tự động gửi sang.
+    </div>
+    <div class="row">
+      <button class="btn" onclick="hide('dlg')">Huỷ</button>
+      <button class="btn btn-p" id="btnImportCookie" onclick="submitImportCookie()">Kích hoạt tài khoản</button>
+    </div>`);
+}
+
+async function submitImportCookie(){
+  const name = q('#ck_name').value.trim();
+  const platform = q('#ck_platform').value;
+  const email = q('#ck_email').value.trim();
+  const cookie = q('#ck_content').value.trim();
+  if(!name) return alert('Vui lòng nhập tên tài khoản');
+  if(!cookie) return alert('Vui lòng dán cookie vào ô bên dưới');
+  
+  const btn = q('#btnImportCookie');
+  if(btn){ btn.disabled = true; btn.textContent = 'Đang kích hoạt…'; }
+  try {
+    const res = await api('/api/admin/accounts/cookie', {
+      method: 'POST',
+      body: { name, platform, email, cookie }
+    });
+    alert(`Thành công! Đã nhập ${res.cookie_count} cookie cho tài khoản "${res.name}". Trạng thái: ${res.active ? 'Hoạt động ✓' : 'Cần kiểm tra'}`);
+    hide('dlg');
+    refresh();
+  } catch(e) {
+    alert('Lỗi import cookie: ' + e.message);
+  } finally {
+    if(btn){ btn.disabled = false; btn.textContent = 'Kích hoạt tài khoản'; }
+  }
+}
+
 /* ---- Task Queue ---- */
 async function loadTasks(){
   const r=await api('/api/admin/tasks?limit=50');
   const sb={'queued':'<span class="badge b-gray">Queued</span>','processing':'<span class="badge b-blue">Processing</span>','completed':'<span class="badge b-green">Completed</span>','failed':'<span class="badge b-red">Failed</span>'};
-  const rows=r.tasks.map(t=>[
-    '<span class="tiny" title="'+esc(t.id)+'">'+t.id.replace('video_','').slice(0,10)+'</span>',
-    '<span class="prompt" title="'+esc(t.prompt||'')+'">'+esc(t.prompt||'')+'</span>',
-    t.account||'-',
-    t.api_key_name||'—',
-    (t.duration||10)+'s',
-    sb[t.status]||'<span class="badge b-gray">'+esc(t.status)+'</span>',
-    fmt(t.created_at),
-    t.video_url
-      ?'<div class="video-wrap"><a href="'+esc(t.video_url)+'" target="_blank">Open</a><button class="btn" onclick="playVideo(&quot;'+esc(t.video_url)+'&quot;)">Preview</button></div>'
-      :(t.status==='failed'?'<span class="tiny" title="'+esc(t.error||'')+'">'+esc((t.error||'').slice(0,30))+'</span>':'—')
-  ]);
+  const rows=r.tasks.map(t=>{
+    let refBadge = '';
+    try {
+      const refs = JSON.parse(t.reference_images || '[]');
+      if (refs && refs.length) {
+        refBadge = ` <span class="badge b-blue" title="${refs.length} ảnh:\n${esc(refs.join('\n'))}">🖼️ ${refs.length > 1 ? refs.length + ' Ảnh' : 'Img2Vid'}</span>`;
+      }
+    } catch(e) {}
+
+    return [
+      '<span class="tiny" title="'+esc(t.id)+'">'+t.id.replace('video_','').slice(0,10)+'</span>',
+      '<span class="prompt" title="'+esc(t.prompt||'')+'">'+esc(t.prompt||'')+refBadge+'</span>',
+      t.account||'-',
+      t.api_key_name||'—',
+      (t.duration||10)+'s',
+      sb[t.status]||'<span class="badge b-gray">'+esc(t.status)+'</span>',
+      fmt(t.created_at),
+      t.video_url
+        ?'<div class="video-wrap"><a href="'+esc(t.video_url)+'" target="_blank">Open</a><button class="btn" onclick="playVideo(&quot;'+esc(t.video_url)+'&quot;)">Preview</button></div>'
+        :(t.status==='failed'?'<span class="tiny" style="color:var(--red);cursor:pointer" title="'+esc(t.error||'')+'" onclick="alert(&quot;Chi tiết lỗi:\n&quot; + this.title)">⚠️ '+esc((t.error||'').slice(0,28))+'…</span>':'—')
+    ];
+  });
+
   q('#tasksTable').innerHTML=table(['Task ID','Prompt','Account','Client','Duration','Status','Created At','Video'],rows);
 }
 
 function playVideo(url){q('#videoEl').src=url;show('videoModal');}
 function closeVideo(){q('#videoEl').pause();q('#videoEl').src='';hide('videoModal');}
+
+let selectedRefFiles = [];
+
+function onRefFileSelected(input) {
+  if (input.files && input.files.length) {
+    for (const f of input.files) {
+      if (!selectedRefFiles.some(x => x.name === f.name && x.size === f.size)) {
+        selectedRefFiles.push(f);
+      }
+    }
+    renderRefThumbnails();
+  }
+}
+
+function removeRefImageAt(idx) {
+  selectedRefFiles.splice(idx, 1);
+  renderRefThumbnails();
+}
+
+function renderRefThumbnails() {
+  const wrap = q('#f_ref_preview_wrap');
+  const nameEl = q('#f_ref_filename');
+  if (!wrap) return;
+  if (selectedRefFiles.length === 0) {
+    wrap.innerHTML = '';
+    wrap.style.display = 'none';
+    if (nameEl) nameEl.textContent = 'Chưa chọn ảnh';
+    return;
+  }
+  if (nameEl) nameEl.textContent = `Đã chọn ${selectedRefFiles.length} ảnh`;
+  wrap.style.display = 'flex';
+  wrap.innerHTML = '';
+  selectedRefFiles.forEach((file, idx) => {
+    const box = document.createElement('div');
+    box.style = 'position:relative;width:fit-content;';
+    const img = document.createElement('img');
+    img.style = 'height:80px;width:80px;border-radius:6px;border:1px solid var(--line);object-fit:cover;display:block';
+    const reader = new FileReader();
+    reader.onload = e => { img.src = e.target.result; };
+    reader.readAsDataURL(file);
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.innerHTML = '✕';
+    btn.style = 'position:absolute;top:-6px;right:-6px;background:#ef4444;color:#fff;border:none;border-radius:50%;width:18px;height:18px;cursor:pointer;font-size:10px;font-weight:bold;line-height:1;display:flex;align-items:center;justify-content:center';
+    btn.onclick = () => removeRefImageAt(idx);
+    box.appendChild(img);
+    box.appendChild(btn);
+    wrap.appendChild(box);
+  });
+}
+
+function openCreateTask(){
+  selectedRefFiles = [];
+  showDlg(`<h2>Generate Video</h2>
+    <label>Prompt</label>
+    <textarea id="f_prompt" rows="3" style="width:100%;padding:8px 12px;border:1px solid var(--line);border-radius:8px;font-size:13px;font-family:inherit;resize:vertical" placeholder="Enter video description (e.g. A cute golden retriever playing on the beach)"></textarea>
+    
+    <label>🖼️ Ảnh tham chiếu (Img2Vid - Chọn 1 hoặc nhiều ảnh)</label>
+    <div style="background:#f8fafc;border:1px dashed #cbd5e1;border-radius:8px;padding:10px;margin-bottom:12px">
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+        <input type="file" id="f_ref_file" multiple accept="image/jpeg,image/png,image/webp" style="display:none" onchange="onRefFileSelected(this)">
+        <button type="button" class="btn" onclick="q('#f_ref_file').click()" style="display:inline-flex;align-items:center;gap:6px">
+          📁 Tải ảnh từ máy tính
+        </button>
+        <span id="f_ref_filename" class="tiny" style="color:var(--sub)">Chưa chọn ảnh (hỗ trợ chọn 2 hoặc nhiều ảnh)</span>
+      </div>
+      <div id="f_ref_preview_wrap" style="display:none;gap:10px;flex-wrap:wrap;margin-top:10px"></div>
+      <div style="font-size:11px;color:var(--sub);margin-top:10px;margin-bottom:4px">Hoặc dán URL ảnh công khai (cách nhau dấu phẩy hoặc dòng mới):</div>
+      <input id="f_ref_url" placeholder="https://... (JPG, PNG, WEBP)" style="width:100%;margin-bottom:0">
+    </div>
+
+    <label>Model</label>
+    <select id="f_model" style="width:100%;padding:8px 12px;border:1px solid var(--line);border-radius:8px;font-size:13px;background:#fff">
+      <option value="seedance-2.5" selected>Seedance 2.5 (Pro · Đề xuất)</option>
+      <option value="seedance-2.0">Seedance 2.0 (Nhanh)</option>
+    </select>
+    <label>Aspect Ratio</label>
+    <select id="f_ratio" style="width:100%;padding:8px 12px;border:1px solid var(--line);border-radius:8px;font-size:13px;background:#fff">
+      <option value="16:9">16:9 (Landscape)</option>
+      <option value="9:16">9:16 (Portrait)</option>
+      <option value="1:1">1:1 (Square)</option>
+      <option value="4:3">4:3</option>
+      <option value="3:4">3:4</option>
+    </select>
+    <label>Duration</label>
+    <select id="f_duration" style="width:100%;padding:8px 12px;border:1px solid var(--line);border-radius:8px;font-size:13px;background:#fff">
+      <option value="10">10 seconds</option>
+      <option value="15">15 seconds</option>
+      <option value="30">30 seconds</option>
+    </select>
+    <div class="row">
+      <button class="btn" onclick="hide('dlg')">Cancel</button>
+      <button class="btn btn-p" id="btnSubmitCreateTask" onclick="submitCreateTask()">Create Task</button>
+    </div>`);
+}
+
+async function submitCreateTask(){
+  const prompt = q('#f_prompt').value.trim();
+  if(!prompt) return alert('Please enter a prompt');
+
+  const btn = q('#btnSubmitCreateTask');
+  if (btn) { btn.disabled = true; btn.textContent = 'Đang tải ảnh & xử lý…'; }
+
+  try {
+    let refImages = [];
+    if (selectedRefFiles && selectedRefFiles.length) {
+      for (const file of selectedRefFiles) {
+        const formData = new FormData();
+        formData.append('file', file);
+        const upRes = await fetch('/api/admin/upload_reference', {
+          method: 'POST',
+          body: formData
+        });
+        if (!upRes.ok) {
+          const err = await upRes.json().catch(() => ({}));
+          throw new Error(err.detail || `Không thể tải ảnh ${file.name} lên server`);
+        }
+        const upData = await upRes.json();
+        refImages.push(upData.url);
+      }
+    }
+    const refUrlInput = q('#f_ref_url')?.value?.trim();
+    if (refUrlInput) {
+      const urls = refUrlInput.split(/[\n,]+/).map(u => u.trim()).filter(Boolean);
+      for (const u of urls) {
+        if (u && !refImages.includes(u)) refImages.push(u);
+      }
+    }
+
+    const body = {
+      prompt: prompt,
+      model: q('#f_model').value,
+      ratio: q('#f_ratio').value,
+      duration: Number(q('#f_duration').value),
+      reference_images: refImages
+    };
+
+    const res = await fetch('/v1/videos/generations', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+
+      body: JSON.stringify(body)
+    });
+    const data = await res.json();
+    if(!res.ok) throw new Error(data.detail || 'Generation failed');
+    hide('dlg');
+    refresh();
+  } catch(e) {
+    alert(e.message);
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = 'Create Task'; }
+  }
+}
 
 /* ---- API Keys ---- */
 async function loadKeys(){

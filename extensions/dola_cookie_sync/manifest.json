@@ -1,0 +1,32 @@
+{
+  "manifest_version": 3,
+  "name": "Dola & Social Cookie Sync",
+  "version": "1.0.1",
+  "description": "1-Click Cookie Export & Sync for Dola and Social Accounts to Dola Render Gateway",
+  "permissions": [
+    "cookies",
+    "storage",
+    "activeTab"
+  ],
+  "host_permissions": [
+    "*://dola.com/*",
+    "*://*.dola.com/*",
+    "*://facebook.com/*",
+    "*://*.facebook.com/*",
+    "http://127.0.0.1:*/*",
+    "http://localhost:*/*"
+  ],
+  "action": {
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icon16.png",
+      "48": "icon48.png",
+      "128": "icon128.png"
+    }
+  },
+  "icons": {
+    "16": "icon16.png",
+    "48": "icon48.png",
+    "128": "icon128.png"
+  }
+}

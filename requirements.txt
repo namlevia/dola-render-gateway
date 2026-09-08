@@ -5,3 +5,7 @@ pydantic
 patchright
 python-dotenv
 pillow
+opencv-python-headless
+numpy
+cryptography
+python-multipart

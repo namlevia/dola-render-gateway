@@ -12,25 +12,44 @@ import hashlib
 import json
 import re
 import shutil
+import sys
 import time
 import uuid
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 from collections import defaultdict
 from pathlib import Path
 
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, File, Header, HTTPException, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 import config
 from add_account import add_account_flow
+from browser import import_account_cookies, parse_cookie_input
 from browser_pool import AllAccountsLimitedError, AllAccountsQuotaBlockedError, BrowserPool
 from media import download_reference_images, validate_reference_urls
 from store import PendingTaskLimitExceeded, TaskQuotaExceeded, TaskStore
+from video_worker_ui import ContentPolicyViolationError
 
 Path(config.DOWNLOAD_DIR).mkdir(parents=True, exist_ok=True)
 Path("web").mkdir(parents=True, exist_ok=True)
 
 app = FastAPI(title="dola-pool", version="0.4.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 
 store = TaskStore(config.DB_PATH)
 pool = BrowserPool(max_concurrency=config.MAX_CONCURRENCY)
@@ -46,7 +65,7 @@ SIZE_TO_RATIO = {
     "1024x1024": "1:1", "1440x1080": "4:3", "1080x1440": "3:4",
 }
 SUPPORTED_DURATIONS = (10, 15, 30)
-NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
+NAME_RE = re.compile(r"^[A-Za-z0-9_@.-]{1,64}$")
 
 
 class KeyConcurrencyLimiter:
@@ -153,7 +172,7 @@ def _normalize_allowed_durations(values) -> list[int]:
 
 
 class VideoGenRequest(BaseModel):
-    model: str = "seedance-2.0"
+    model: str = "seedance-2.5"
     prompt: str = Field(..., min_length=1)
     size: str | None = None
     ratio: str | None = None
@@ -204,6 +223,9 @@ async def _run_task(task_id, model, prompt, ratio, duration, reference_images, c
         store.update(task_id, status="completed", video_url=public_url,
                      account=result.get("account"), last_poll_at=time.time(),
                      finished_at=time.time())
+    except ContentPolicyViolationError as e:
+        store.update(task_id, status="failed", error=str(e)[:500],
+                     failure_code="400_POLICY_VIOLATION", finished_at=time.time())
     except (AllAccountsLimitedError, AllAccountsQuotaBlockedError) as e:
         store.update(task_id, status="failed", error=str(e)[:500],
                      failure_code="429", finished_at=time.time())
@@ -242,9 +264,13 @@ async def _resume_task(row: dict):
         store.update(task_id, status="completed", video_url=public_url,
                      account=result.get("account"), last_poll_at=time.time(),
                      finished_at=time.time())
+    except ContentPolicyViolationError as e:
+        store.update(task_id, status="failed", error=str(e)[:500],
+                     failure_code="400_POLICY_VIOLATION", finished_at=time.time())
     except Exception as e:
         store.update(task_id, status="failed", error=str(e)[:500],
                      finished_at=time.time())
+
     finally:
         if acquired:
             await key_limiter.release(api_key_hash)
@@ -369,6 +395,7 @@ class AccountPatch(BaseModel):
     scheduling: bool | None = None
     note: str | None = None
     email: str | None = None
+    daily_limit: int | None = Field(None, ge=1, le=1_000_000)
 
 
 class AccountAdd(BaseModel):
@@ -376,6 +403,14 @@ class AccountAdd(BaseModel):
     email: str
     password: str
     totp: str
+
+
+class CookieImport(BaseModel):
+    name: str
+    cookie: str
+    email: str = ""
+    note: str = ""
+    platform: str = "dola"
 
 
 class KeyCreate(BaseModel):
@@ -422,6 +457,17 @@ async def admin_account_patch(name: str, body: AccountPatch,
         pool.set_note(name, body.note)
     if body.email is not None:
         pool.set_email(name, body.email)
+    if body.daily_limit is not None:
+        pool.set_daily_limit(name, body.daily_limit)
+    return {"ok": True}
+
+
+@app.post("/api/admin/accounts/{name}/reset_usage")
+async def admin_account_reset_usage(name: str, x_admin_key: str | None = Header(default=None)):
+    _admin_auth(x_admin_key)
+    if name not in pool.accounts:
+        raise HTTPException(404, "account not found")
+    pool.reset_usage(name)
     return {"ok": True}
 
 
@@ -473,7 +519,73 @@ async def admin_account_add(body: AccountAdd, x_admin_key: str | None = Header(d
     return {"ok": True, "job": "running"}
 
 
+@app.post("/api/admin/accounts/cookie")
+async def admin_account_cookie_import(body: CookieImport, x_admin_key: str | None = Header(default=None)):
+    _admin_auth(x_admin_key)
+    body.name = (body.name or "").strip()
+    if not NAME_RE.match(body.name):
+        raise HTTPException(400, "invalid account name (use 1-64 chars: alphanumeric, _, -, ., @)")
+    if not body.email and "@" in body.name:
+        body.email = body.name
+    default_domain = ".facebook.com" if body.platform.lower() == "facebook" else ".dola.com"
+    cookies = parse_cookie_input(body.cookie, default_domain=default_domain)
+    if not cookies:
+        raise HTTPException(400, "no valid cookies found in input")
+    try:
+        login_ok = await import_account_cookies(body.name, cookies, default_domain=default_domain)
+        pool.set_login_status(body.name, login_ok)
+        if body.email:
+            pool.set_email(body.name, body.email)
+        note = body.note or (f"Platform: {body.platform}" if body.platform.lower() != "dola" else "")
+        if note:
+            pool.set_note(body.name, note)
+    except Exception as e:
+        raise HTTPException(500, f"failed to import cookies: {e}")
+    return {"ok": login_ok, "name": body.name, "cookie_count": len(cookies), "platform": body.platform, "active": login_ok}
+
+
+
+@app.post("/api/admin/upload_reference")
+async def admin_upload_reference(
+    file: UploadFile = File(...),
+    x_admin_key: str | None = Header(default=None),
+):
+    _admin_auth(x_admin_key)
+    filename = file.filename or "reference.png"
+    ext = Path(filename).suffix.lower()
+    if ext not in {".jpg", ".jpeg", ".png", ".webp"}:
+        raise HTTPException(400, "Only JPG, PNG, and WEBP image files are supported")
+    safe_name = f"ref_{uuid.uuid4().hex[:12]}_{re.sub(r'[^a-zA-Z0-9._-]', '_', filename)}"
+    dest = Path(config.DOWNLOAD_DIR) / safe_name
+    content = await file.read()
+    if len(content) > config.REFERENCE_IMAGE_MAX_BYTES:
+        raise HTTPException(400, f"Image size exceeds maximum limit of {config.REFERENCE_IMAGE_MAX_BYTES // 1048576}MB")
+    dest.write_bytes(content)
+    public_url = f"{config.PUBLIC_BASE}/videos/{safe_name}"
+    return {"ok": True, "filename": safe_name, "url": public_url, "local_path": str(dest)}
+
+
+@app.get("/api/admin/live_screenshot")
+async def admin_live_screenshot(x_admin_key: str | None = Header(default=None)):
+    _admin_auth(x_admin_key)
+    p = Path("scratch/current_dola_chat.png")
+    if not p.exists():
+        p = Path("scratch/rejected_chat.png")
+    if p.exists():
+        return FileResponse(
+            str(p),
+            media_type="image/png",
+            headers={
+                "Cache-Control": "no-cache, no-store, must-revalidate",
+                "Pragma": "no-cache",
+                "Expires": "0"
+            }
+        )
+    raise HTTPException(404, "No live screenshot available yet")
+
+
 @app.get("/api/admin/jobs")
+
 async def admin_jobs(x_admin_key: str | None = Header(default=None)):
     _admin_auth(x_admin_key)
     return {"jobs": JOBS}
@@ -558,6 +670,17 @@ async def admin_key_delete(key: str, x_admin_key: str | None = Header(default=No
         raise HTTPException(404, "api key not found")
     store.delete_key(key)
     return {"ok": True}
+
+
+@app.get("/")
+@app.get("/web")
+@app.get("/web/")
+async def serve_web():
+    return FileResponse("web/index.html", headers={
+        "Cache-Control": "no-cache, no-store, must-revalidate",
+        "Pragma": "no-cache",
+        "Expires": "0"
+    })
 
 
 # Dashboard single-file frontend

@@ -7,8 +7,8 @@
 		},
 		"video_generation": {
 			"meta": {
-				"title": "视频生成",
-				"desc": "自由运镜，图片文字一键成片",
+				"title": "???????",
+				"desc": "?????????????????????",
 				"option_list": [{
 					"type": 3,
 					"value": "ratio",
@@ -56,12 +56,12 @@
 					}, {
 						"show_name": "10s",
 						"value": "10",
-						"is_default": true,
+						"is_default": false,
 						"sub_display": ""
 					}, {
 						"show_name": "30s",
 						"value": "30",
-						"is_default": false,
+						"is_default": true,
 						"sub_display": ""
 					}]
 				}, {

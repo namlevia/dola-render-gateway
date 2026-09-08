@@ -1,34 +1,107 @@
 {
   "manifest_version": 3,
-  "name": "Dola Studio Profile Extension",
-  "version": "1.0.0",
-  "description": "Developer profile extension for session management and media handling.",
+  "name": "Seedance Studio Pro (Dola-Pool Engine Edition)",
+  "version": "1.8.14",
+  "description": "Seedance Studio Pro by Sonicvoice.pro — tạo video Dola 1080P không watermark. Hỗ trợ Zalo 0908449168 · Nhóm cộng đồng Creator Việt Nam.",
+  "icons": {
+    "16": "icon16.png",
+    "48": "icon48.png",
+    "128": "icon128.png"
+  },
   "permissions": [
     "debugger",
     "tabs",
-    "downloads"
+    "scripting",
+    "downloads",
+    "storage",
+    "sidePanel",
+    "cookies",
+    "declarativeNetRequest",
+    "declarativeNetRequestWithHostAccess"
   ],
   "host_permissions": [
-    "*://*.doubao.com/*",
     "*://*.dola.com/*",
-    "*://*.byteintlapi.com/*"
+    "*://*.doubao.com/*",
+    "*://*.byteintlapi.com/*",
+    "*://*.ibytedtos.com/*",
+    "https://dola.com/*",
+    "https://www.dola.com/*"
   ],
   "background": {
-    "service_worker": "service-worker.js"
+    "service_worker": "background.js"
   },
   "content_scripts": [
     {
       "matches": [
+        "*://*.dola.com/*",
         "*://*.doubao.com/*",
-        "*://*.dola.com/*"
+        "https://dola.com/*",
+        "https://www.dola.com/*"
       ],
       "js": [
-        "content-panel.js"
+        "extension-logger.js",
+        "content.js",
+        "verified-image-upload-content.js"
       ],
+      "run_at": "document_start"
+    },
+    {
+      "matches": [
+        "*://*.dola.com/*",
+        "*://*.doubao.com/*",
+        "https://dola.com/*",
+        "https://www.dola.com/*"
+      ],
+      "js": [
+        "extension-logger.js",
+        "page-bridge.js"
+      ],
+      "world": "MAIN",
+      "run_at": "document_start"
+    },
+    {
+      "matches": [
+        "*://*.dola.com/*",
+        "*://*.doubao.com/*",
+        "https://dola.com/*",
+        "https://www.dola.com/*"
+      ],
+      "js": [
+        "image-attachment-main.js"
+      ],
+      "world": "MAIN",
       "run_at": "document_idle"
     }
   ],
+  "side_panel": {
+    "default_path": "popup.html"
+  },
   "action": {
-    "default_title": "Dola Studio Profile"
-  }
+    "default_title": "Seedance Studio Pro",
+    "default_icon": {
+      "16": "icon16.png",
+      "48": "icon48.png",
+      "128": "icon128.png"
+    }
+  },
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "extension-logger.js",
+        "dola-skill-pack-response.json",
+        "doubao-skill-pack-response.json",
+        "brand-icon.svg",
+        "icon16.png",
+        "icon48.png",
+        "icon128.png",
+        "page-bridge.js"
+      ],
+      "matches": [
+        "*://*.dola.com/*",
+        "*://*.doubao.com/*",
+        "https://dola.com/*",
+        "https://www.dola.com/*"
+      ]
+    }
+  ]
 }

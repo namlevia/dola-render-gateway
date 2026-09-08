@@ -7,6 +7,11 @@ import sys
 import time
 from pathlib import Path
 
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
 import aiohttp
 from patchright.async_api import async_playwright
 
@@ -24,6 +29,20 @@ DAILY_LIMIT_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+# Content policy / minor safety rejection pattern
+POLICY_REJECT_PATTERN = re.compile(
+    r"cấm tạo nội dung|"
+    r"hạn chế tạo nội dung|"
+    r"không thể tạo nội dung theo yêu cầu|"
+    r"không thể thực hiện yêu cầu tạo|"
+    r"vi phạm chính sách|tiêu chuẩn cộng đồng|"
+    r"コンテンツポリシー|利用規約|ガイドライン|ポリシー違反|未成年者?の保護|安全基準|"
+    r"生成することができません|生成できません|お応えできません|"
+    r"违规|内容安全|无法生成|社区准则|不符合规范|"
+    r"content policy|safety guideline|violat|cannot generate|unable to generate|policy restriction",
+    re.IGNORECASE,
+)
+
 
 class AccountLimitedError(Exception):
     """Account reached daily video generation limit."""
@@ -31,6 +50,10 @@ class AccountLimitedError(Exception):
 
 class CreditInsufficientError(Exception):
     """Insufficient points prior to generation."""
+
+
+class ContentPolicyViolationError(Exception):
+    """Prompt or reference image rejected by Dola content/safety policies."""
 
 
 VIDEO_BTN = "text=動画を作成"          # Entry point button in ja-JP locale
@@ -129,11 +152,14 @@ async def _fetch_bytes(url: str) -> bytes:
 
 
 async def attach_reference_images(page, image_paths: list[str]) -> None:
-    """Uploads reference images through native file input and waits for TOS upload."""
+    """Uploads reference images through Dola's '+' attachment button or native file input, and waits for TOS upload."""
     if not image_paths:
         return
-    file_input = page.locator('input[type="file"]').first
-    await file_input.wait_for(state="attached", timeout=10000)
+
+    abs_paths = [str(Path(p).resolve()) for p in image_paths]
+    expected = len(abs_paths)
+    print(f"[upload] Attaching {expected} reference image(s): {abs_paths}", flush=True)
+
     events = []
 
     def on_response(response):
@@ -143,24 +169,85 @@ async def attach_reference_images(page, image_paths: list[str]) -> None:
 
     page.on("response", on_response)
     try:
-        await file_input.set_input_files(image_paths)
-        expected = len(image_paths)
-        deadline = time.time() + max(60, expected * 20)
+        assigned = False
+        # Check if file input is already mounted in DOM
+        file_input = page.locator('input[type="file"]').first
+        if await file_input.count():
+            try:
+                await file_input.set_input_files(abs_paths)
+                assigned = True
+                print("[upload] Assigned files via pre-existing input[type='file'] ✓", flush=True)
+            except Exception as e:
+                print(f"  (Pre-existing input failed: {e})", flush=True)
+
+        if not assigned:
+            # Find the visible '+' button in composer to mount file input
+            plus_btn = None
+            for b in await page.locator("button").all():
+                try:
+                    if not await b.is_visible():
+                        continue
+                    path = await b.locator("path").first.get_attribute("d") if await b.locator("path").count() else ""
+                    if path and "M12" in path and "2.25" in path:
+                        plus_btn = b
+                        break
+                except Exception:
+                    continue
+
+            if plus_btn:
+                # 1. Click plus button to trigger Dola's hidden file input mounting
+                try:
+                    await plus_btn.click(timeout=5000)
+                    await page.wait_for_timeout(300)
+                except Exception as e:
+                    print(f"  (Plus button click: {e})", flush=True)
+
+                # 2. Wait for input[type="file"] to be attached and set files directly
+                try:
+                    file_input = page.locator('input[type="file"]').first
+                    await file_input.wait_for(state="attached", timeout=5000)
+                    await file_input.set_input_files(abs_paths)
+                    assigned = True
+                    print("[upload] Assigned files via mounted input[type='file'] ✓", flush=True)
+                except Exception as e:
+                    print(f"  (Mounted input set_input_files: {e})", flush=True)
+
+                # 3. Fallback to expect_file_chooser if direct mount didn't assign
+                if not assigned:
+                    try:
+                        async with page.expect_file_chooser(timeout=5000) as fc_info:
+                            await plus_btn.click(timeout=3000)
+                        file_chooser = await fc_info.value
+                        await file_chooser.set_files(abs_paths)
+                        assigned = True
+                        print("[upload] Assigned files via expect_file_chooser fallback ✓", flush=True)
+                    except Exception as e:
+                        print(f"  (Plus button file_chooser fallback: {e})", flush=True)
+
+        if not assigned:
+            raise RuntimeError("Could not find visible '+' button or input[type='file'] on Dola page to attach image")
+
+        # Wait for TOS upload & thumbnail render
+        deadline = time.time() + max(45, expected * 20)
         while time.time() < deadline:
+            await page.wait_for_timeout(500)
             prepare_count = sum("/alice/resource/prepare_upload" in url and 200 <= status < 300
                                 for status, url in events)
             tos_count = sum("/upload/v1/" in url and 200 <= status < 300
                             for status, url in events)
-            # Wait for thumbnails and TOS completion before sending
-            thumb_count = await page.locator('img[alt]').count()
-            if prepare_count >= expected and tos_count >= expected and thumb_count >= expected:
-                await page.wait_for_timeout(800)
-                print(f"[upload] Reference images uploaded: {expected} image(s)", flush=True)
+            has_preview = await page.evaluate(r"""() => {
+                const text = document.body.innerText || '';
+                const hasChipText = /mô\s*tả\s*hình\s*ảnh|describe\s*image|画像を説明/i.test(text);
+                const composer = document.querySelector('textarea, [contenteditable="true"]')?.closest('div');
+                const hasImg = !!composer?.parentElement?.querySelector('img');
+                return hasChipText || hasImg;
+            }""")
+            if (prepare_count >= expected and tos_count >= expected) or has_preview:
+                await page.wait_for_timeout(1000)
+                print(f"[upload] Reference image attached successfully! (preview confirmed: {has_preview})", flush=True)
                 return
-            await page.wait_for_timeout(250)
-        raise TimeoutError(
-            f"Reference image upload timeout: prepare={prepare_count}/{expected}, tos={tos_count}/{expected}"
-        )
+
+        print("[upload] Warning: upload deadline reached, proceeding with prompt...", flush=True)
     finally:
         page.remove_listener("response", on_response)
 
@@ -242,9 +329,11 @@ async def solve_slider(page, frame, attempt: int) -> bool:
 
 _BALANCE_PATTERNS = (
     re.compile(r"(?:本日は|今日(?:还剩|剩余)?|今天).*?(\d+)\s*(?:ポイント|积分|points?)", re.I),
-    re.compile(r"(?:remaining|left)\s*[:：]?\s*(\d+)\s*points?", re.I),
+    re.compile(r"本日は残り\s*(\d+)", re.I),
+    re.compile(r"(?:remaining|left)\s*[:：]?\s*(\d+)\s*(?:points?|credits?)", re.I),
     re.compile(r"(?:还剩|剩余|还有)\s*(\d+)\s*(?:积分|点)", re.I),
 )
+
 
 
 def _parse_balance_texts(texts: list[str]) -> tuple[int | None, bool, str]:
@@ -279,25 +368,162 @@ async def _preflight_balance(page, ms_token: str, fp: str, required: int) -> dic
         return {"balance": None, "source": ""}
 
 
+def format_dola_prompt(prompt: str, ratio: str = "16:9", duration: int = 15, model_key: str = "seedance_v2.0") -> str:
+    """Cleans and formats prompt with ratio, duration, model, and direct commands for Dola Pro Chatbot."""
+    clean = str(prompt or "").strip()
+    if not clean:
+        return ""
+
+    # Strip existing chatbot commands, duration, ratio, and model tokens to avoid duplication
+    clean = re.sub(r"^(?:tạo\s*video|create\s*videos?)\s*:\s*", "", clean, flags=re.I)
+    clean = re.sub(r",?\s*tạo\s*video\s*luôn\s*(?:ko|không)\s*hỏi\s*lại", "", clean, flags=re.I)
+    clean = re.sub(r",?\s*gửi\s*dưới\s*dạng\s*human\s*artifact", "", clean, flags=re.I)
+    clean = re.sub(r",?\s*(?:ko|không)\s*hỏi\s*lại", "", clean, flags=re.I)
+    clean = re.sub(r",?\s*(?:thời\s*lượng|duration)\s*[:\s]*\d+\s*s?", "", clean, flags=re.I)
+    clean = re.sub(r",?\s*(?:mô\s*hình|model|seedance)\s*[:\s]*[\w\.\s]+", "", clean, flags=re.I)
+    clean = re.sub(r"(?:,\s*)?(?:tỉ\s*lệ|ratio)?\s*[:\s]*\b(16:9|9:16|1:1|4:3|21:9)\b", "", clean, flags=re.I)
+    clean = re.sub(r"[,;\s]+$", "", clean).strip()
+
+    clean_ratio = ratio if ratio and ratio.lower() != "none" else "16:9"
+    clean_duration = int(duration) if duration else 15
+    model_str = str(model_key or "").lower()
+    model_label = "Seedance 2.5" if "2.5" in model_str or "25" in model_str else "Seedance 2.0"
+
+    return f"{clean}, tỉ lệ {clean_ratio}, thời lượng {clean_duration}s, mô hình {model_label}, tạo video luôn không hỏi lại, gửi dưới dạng human artifact"
+
+
+async def trigger_new_chat(page) -> bool:
+    """Ensures a clean new chat session is active via shortcut and button click."""
+    # 1. Keyboard shortcut
+    try:
+        await page.keyboard.press("Control+Shift+K")
+        await page.wait_for_timeout(800)
+    except Exception:
+        pass
+
+    # 2. Click button via DOM
+    clicked = await page.evaluate(r"""() => {
+        const candidates = Array.from(
+            document.querySelectorAll('button, a, [role="button"], div[tabindex], span[role="button"]')
+        );
+        for (const el of candidates) {
+            const text = (el.innerText || el.textContent || '').trim();
+            const aria = (el.getAttribute('aria-label') || el.getAttribute('title') || '').trim();
+            const blob = `${aria} ${text}`.toLowerCase();
+            if (/(collapse|expand|toggle)\s*(sidebar|panel|nav)|thu\s*(gọn|sidebar)|đóng\s*sidebar|mở\s*sidebar/i.test(blob)) {
+                continue;
+            }
+            if (/new\s*chat|cuộc\s*trò\s*chuyện\s*mới|đoạn\s*chat\s*mới|tạo\s*chat\s*mới|新しいチャット/i.test(blob)) {
+                el.click();
+                return true;
+            }
+        }
+        const directLink = document.querySelector('a[href="/chat"], a[href="/chat/"]');
+        if (directLink) {
+            directLink.click();
+            return true;
+        }
+        return false;
+    }""")
+    await page.wait_for_timeout(1200)
+    return clicked
+
+
+async def ensure_normal_chat_mode(page) -> bool:
+    """Exits Video Skill mode if active, returning to normal chat mode."""
+    exited = await page.evaluate(r"""() => {
+        const exitBtn = document.querySelector('[class*="exit-skill"], .bg-g-exit-skill-btn-bg, [data-testid*="exit-skill"], [class*="exit-btn"]');
+        if (exitBtn) {
+            exitBtn.click();
+            return true;
+        }
+        const chips = Array.from(document.querySelectorAll('button[data-component-type="skill-item"], button, [class*="chip"]'));
+        for (const chip of chips) {
+            const t = (chip.innerText || chip.textContent || '').trim();
+            if (/create\s*videos?|tạo\s*videos?|動画を作成/i.test(t)) {
+                const closeIcon = chip.querySelector('svg, [class*="close"], [class*="exit"]');
+                if (closeIcon) {
+                    closeIcon.click();
+                    return true;
+                }
+            }
+        }
+        return false;
+    }""")
+    await page.wait_for_timeout(600)
+    return exited
+
+
+async def ensure_dola_model(page, is_pro: bool = True) -> bool:
+    """Ensures Dola is in Pro (Seedance 2.5) or Fast (Seedance 2.0) mode."""
+    try:
+        model_btn = page.locator('button:has-text("高速"), button:has-text("Fast"), button:has-text("Nhanh"), button:has-text("Pro"), button:has-text("プロ")').first
+        if not await model_btn.count():
+            return False
+
+        cur_text = (await model_btn.text_content() or '').strip()
+        is_current_pro = "pro" in cur_text.lower() or "プロ" in cur_text
+
+        if is_pro == is_current_pro:
+            print(f"[mode] Dola model already in desired mode: '{cur_text}'", flush=True)
+            return True
+
+        print(f"[mode] Switching Dola model from '{cur_text}' to {'Pro' if is_pro else 'Fast'}...", flush=True)
+        await model_btn.click(timeout=5000)
+        await page.wait_for_timeout(600)
+
+        if is_pro:
+            target_opt = page.locator('div:has-text("プロ"), div:has-text("Pro"), [role="menuitem"]:has-text("Pro"), [role="menuitem"]:has-text("プロ")').last
+        else:
+            target_opt = page.locator('div:has-text("高速"), div:has-text("Fast"), div:has-text("Nhanh"), [role="menuitem"]:has-text("Fast"), [role="menuitem"]:has-text("Nhanh")').first
+
+        if await target_opt.count():
+            await target_opt.click(timeout=5000)
+            await page.wait_for_timeout(800)
+            new_text = (await model_btn.text_content() or '').strip()
+            print(f"[mode] Dola model successfully switched to: '{new_text}' ✓", flush=True)
+            return True
+
+        await page.keyboard.press("Escape")
+    except Exception as e:
+        print(f"[mode] Failed to switch Dola model: {e}", flush=True)
+    return False
+
+
 async def poll_conversation(account: str, page, context, conversation_id: str,
-                            timeout: int, on_poll=None, on_balance=None) -> dict:
+                            timeout: int, on_poll=None, on_balance=None,
+                            existing_videos: set | None = None) -> dict:
     """Polls accepted conversation for video completion."""
     cookies = await context.cookies("https://www.dola.com")
     ms_token, fp = cookie_value(cookies, "msToken"), cookie_value(cookies, "s_v_web_id")
     start = time.time()
     last_callback = 0.0
+    last_screenshot = 0.0
+    known_old = existing_videos or set()
     while time.time() - start < timeout:
         await asyncio.sleep(5)
+        now = time.time()
+
+        # Periodically capture current Dola chat screen for monitoring
+        if now - last_screenshot >= 15:
+            try:
+                Path("scratch").mkdir(exist_ok=True)
+                await page.screenshot(path="scratch/current_dola_chat.png")
+                last_screenshot = now
+            except Exception:
+                pass
+
         try:
             poll = await asyncio.wait_for(page.evaluate(
                 POLL_JS, {"conversationId": conversation_id, "msToken": ms_token, "fp": fp}), timeout=30)
         except Exception as e:
             print(f"  Polling exception: {e}", flush=True)
             continue
-        now = time.time()
+
         if on_poll and now - last_callback >= 30:
             on_poll(now)
             last_callback = now
+
         for text in poll.get("texts", []):
             balance, _, source = _parse_balance_texts([text])
             if balance is not None and on_balance:
@@ -306,17 +532,58 @@ async def poll_conversation(account: str, page, context, conversation_id: str,
                 raise AccountLimitedError(f"Account daily limit reached: {text[:120]}")
             if CREDIT_FAIL_PATTERN.search(text):
                 raise CreditError(f"Insufficient quota: {text[:80]}")
+            if POLICY_REJECT_PATTERN.search(text):
+                try:
+                    Path("scratch").mkdir(exist_ok=True)
+                    await page.screenshot(path="scratch/current_dola_chat.png")
+                except Exception:
+                    pass
+                print(f"[{account}] Content rejected by Dola policy: {text.strip()[:180]}", flush=True)
+                raise ContentPolicyViolationError(f"Dola từ chối nội dung: {text.strip()[:180]}")
+
+        # Fallback check on page DOM for safety warnings
+        try:
+            dom_texts = await page.locator(".error, .warning, [class*='error'], [class*='warning'], [class*='message']").all_text_contents()
+            for dt in dom_texts:
+                if POLICY_REJECT_PATTERN.search(dt):
+                    try:
+                        Path("scratch").mkdir(exist_ok=True)
+                        await page.screenshot(path="scratch/current_dola_chat.png")
+                    except Exception:
+                        pass
+                    print(f"[{account}] Content rejected by Dola (DOM): {dt.strip()[:180]}", flush=True)
+                    raise ContentPolicyViolationError(f"Dola từ chối nội dung: {dt.strip()[:180]}")
+        except ContentPolicyViolationError:
+            raise
+        except Exception:
+            pass
+
         if poll.get("videos"):
+            videos = poll["videos"]
             video_models = poll.get("videoModels", [])
-            url = extract_unwatermarked_url(
-                video_models[0] if video_models else "", poll["videos"][0])
-            print(f"[{account}] Completed! Downloading (unwatermarked priority)...", flush=True)
-            local = await _download(url, account)
-            print(f"[{account}] Downloaded {local} ({local.stat().st_size / 1e6:.1f} MB)", flush=True)
-            return {"video_url": url, "local_path": str(local),
-                    "conversation_id": conversation_id, "account": account}
+            # Filter out any video that was already present in this conversation before prompt submission
+            new_candidates = []
+            for i, v_url in enumerate(videos):
+                if v_url not in known_old:
+                    vm = video_models[i] if i < len(video_models) else ""
+                    new_candidates.append((v_url, vm))
+
+            if new_candidates:
+                v_url, vm = new_candidates[0]
+                url = extract_unwatermarked_url(vm, v_url)
+                print(f"[{account}] Completed! Downloading (unwatermarked priority)...", flush=True)
+                local = await _download(url, account)
+                print(f"[{account}] Downloaded {local} ({local.stat().st_size / 1e6:.1f} MB)", flush=True)
+                try:
+                    Path("scratch").mkdir(exist_ok=True)
+                    await page.screenshot(path="scratch/current_dola_chat.png")
+                except Exception:
+                    pass
+                return {"video_url": url, "local_path": str(local),
+                        "conversation_id": conversation_id, "account": account}
         print(f"  ...Generating ({int(time.time() - start)}s)", flush=True)
     raise TimeoutError(f"No video generated within {timeout}s (conversation_id={conversation_id})")
+
 
 
 async def resume_video(account: str, conversation_id: str, timeout: int,
@@ -369,61 +636,90 @@ async def generate_video(account: str, prompt: str, ratio: str = None,
             ms_token, fp = cookie_value(cookies, "msToken"), cookie_value(cookies, "s_v_web_id")
             await _preflight_balance(page, ms_token, fp, config.VIDEO_REQUIRED_POINTS)
 
-            # ---- UI Submission ----
-            await page.click(VIDEO_BTN)
-            await page.wait_for_timeout(1500)
+            # ---- Check pre-existing conversation and video state ----
+            old_conv_id = None
+            current_tail = page.url.split("?")[0].rstrip("/").split("/")[-1]
+            if current_tail.isdigit():
+                old_conv_id = current_tail
+
+            existing_videos = set()
+            try:
+                if old_conv_id:
+                    poll_old = await page.evaluate(
+                        POLL_JS, {"conversationId": old_conv_id, "msToken": ms_token, "fp": fp}
+                    )
+                    for v in poll_old.get("videos", []):
+                        existing_videos.add(v)
+            except Exception:
+                pass
+            for v_el in await page.locator("video").all():
+                try:
+                    src = await v_el.get_attribute("src")
+                    if src:
+                        existing_videos.add(src)
+                except Exception:
+                    pass
+
+            # ---- Always start fresh chat for each generation ----
+            print(f"[{account}] Opening new chat (old_conv={old_conv_id})...", flush=True)
+            await trigger_new_chat(page)
+            await page.wait_for_timeout(1000)
+
+            # ---- Reference Images ----
             if reference_image_paths:
                 await attach_reference_images(page, reference_image_paths)
-            # Select model in UI
-            try:
-                current_model = None
-                for label in ("モデル 2.0高速", "モデル 2.5"):
-                    loc = page.get_by_text(label, exact=True).first
-                    if await loc.count() and await loc.is_visible():
-                        current_model = loc
-                        break
-                if current_model is None:
-                    current_model = page.get_by_text(re.compile(r"^モデル "), exact=False).first
-                await current_model.click(timeout=5000)
-                await page.wait_for_timeout(500)
-                options = (("Dreamina Seedance 2.5",)
-                           if model_key == "seedance_v2.5"
-                           else ("Dreamina Seedance 2.0高速", "Dreamina Seedance 2.0", "Seedance2.0Fast"))
-                selected = False
-                for option_text in options:
-                    loc = page.get_by_text(option_text, exact=False).first
-                    if await loc.count() and await loc.is_visible():
-                        await loc.click(timeout=5000)
-                        selected = True
-                        break
-                if not selected:
-                    raise RuntimeError("Model option not found")
-                await page.wait_for_timeout(500)
-            except Exception as e:
-                raise RuntimeError(f"Failed to set model ({model_key}): {str(e)[:120]}") from e
-            if ratio:
+
+            # ---- Submission Mode ----
+            if duration == 30:
+                # 30s credit video mode via Action Bar dropdown (requires Dola30 extension)
+                await page.click(VIDEO_BTN)
+                await page.wait_for_timeout(1500)
                 try:
-                    await page.click("text=比率", timeout=3000)
-                    await page.wait_for_timeout(500)
-                    await page.click(f"text={ratio}", timeout=3000)
+                    dur_btn = page.locator('[data-input-engine-actionbar-control-key="video-duration"]').first
+                    if await dur_btn.count() and await dur_btn.is_visible():
+                        cur_text = (await dur_btn.text_content() or "").strip()
+                        if "30s" not in cur_text.lower():
+                            await dur_btn.click(timeout=3000)
+                            await page.wait_for_timeout(500)
+                            await page.locator('[role="menuitem"]:has-text("30s"), [role="option"]:has-text("30s"), text="30s"').last.click(timeout=3000)
                 except Exception as e:
-                    print(f"  (Failed to set ratio, using default: {str(e)[:80]})", flush=True)
-            if duration:
-                try:
-                    await page.click(f"text={duration}s", timeout=3000)
-                except Exception:
-                    try:  # Open duration dropdown
-                        await page.get_by_text(re.compile(r"^\d+s$")).first.click(timeout=3000)
+                    print(f"  (Failed to select 30s: {str(e)[:80]})", flush=True)
+                if ratio:
+                    try:
+                        await page.click("text=比率", timeout=3000)
                         await page.wait_for_timeout(500)
-                        await page.click(f"text={duration}s", timeout=3000)
+                        await page.click(f"text={ratio}", timeout=3000)
                     except Exception as e:
-                        print(f"  (Failed to set duration, using default: {str(e)[:80]})", flush=True)
+                        print(f"  (Failed to set ratio: {str(e)[:80]})", flush=True)
+                prompt_to_send = prompt
+            else:
+                # 10s / 15s Normal Pro Chat mode with prompt tail parameter injection
+                await ensure_normal_chat_mode(page)
+                is_pro = "2.0" not in model_key or "2.5" in model_key or "pro" in model_key
+                await ensure_dola_model(page, is_pro=is_pro)
+                prompt_to_send = format_dola_prompt(prompt, ratio=ratio or "16:9", duration=duration or 15, model_key=model_key)
+
+            # Type and submit prompt
             box = await page.query_selector("textarea") or await page.query_selector('[contenteditable="true"]')
+            if not box:
+                raise RuntimeError("Dola input box not found")
             await box.click()
-            await page.keyboard.type(prompt, delay=100)
-            await page.wait_for_timeout(600)
-            await page.keyboard.press("Enter")
-            print(f"[{account}] UI submitted prompt: {prompt[:40]}", flush=True)
+            await page.keyboard.type(prompt_to_send, delay=25)
+            await page.wait_for_timeout(800)
+
+            # Click official Dola send button (#flow-end-msg-send) or fallback to Enter
+            send_btn = page.locator("button#flow-end-msg-send, button:has-text('Send'), button[aria-label*='Send']").first
+            if await send_btn.count() and await send_btn.is_visible():
+                await send_btn.click(timeout=5000)
+                print(f"[{account}] Clicked official send button (#flow-end-msg-send)", flush=True)
+            else:
+                await page.keyboard.press("Enter")
+                print(f"[{account}] Sent prompt via Enter key", flush=True)
+
+            try:
+                print(f"[{account}] UI submitted prompt: {prompt_to_send[:60]}...", flush=True)
+            except Exception:
+                pass
 
             # ---- Captcha Solver (up to 3 attempts) ----
             solved_or_absent = False
@@ -448,23 +744,27 @@ async def generate_video(account: str, prompt: str, ratio: str = None,
                 await page.screenshot(path="solve_fail.png")
                 raise RiskControlError("Captcha failed 3 times")
 
-            # ---- Wait for real conversation_id ----
+            # ---- Wait for real NEW conversation_id ----
             conv_id = ""
-            for _ in range(30):
+            for _ in range(45):
                 await page.wait_for_timeout(1000)
-                tail = page.url.rstrip("/").split("/")[-1]
-                if tail.isdigit():
+                tail = page.url.split("?")[0].rstrip("/").split("/")[-1]
+                if tail.isdigit() and tail != old_conv_id:
                     conv_id = tail
                     break
             if not conv_id:
-                await page.screenshot(path="no_conv.png")
-                raise TimeoutError("conversation_id not acquired within 30s")
-            print(f"[{account}] conversation_id={conv_id}, polling for video...", flush=True)
+                tail = page.url.split("?")[0].rstrip("/").split("/")[-1]
+                if tail.isdigit():
+                    conv_id = tail
+                else:
+                    await page.screenshot(path="no_conv.png")
+                    raise TimeoutError("conversation_id not acquired within 45s")
+            print(f"[{account}] conversation_id={conv_id}, polling for new video (ignoring {len(existing_videos)} existing)...", flush=True)
 
             deadline = time.time() + timeout
             if on_conversation_id:
                 on_conversation_id(account, conv_id, deadline)
-            return await poll_conversation(account, page, context, conv_id, timeout, on_poll, on_balance)
+            return await poll_conversation(account, page, context, conv_id, timeout, on_poll, on_balance, existing_videos=existing_videos)
         finally:
             await context.close()
 
